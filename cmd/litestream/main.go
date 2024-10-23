@@ -12,6 +12,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,7 +24,6 @@ import (
 	"github.com/benbjohnson/litestream/s3"
 	"github.com/benbjohnson/litestream/sftp"
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/superfly/ltx"
 	"gopkg.in/yaml.v2"
 )
 
@@ -74,6 +74,8 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 	switch cmd {
 	case "databases":
 		return (&DatabasesCommand{}).Run(ctx, args)
+	case "generations":
+		return (&GenerationsCommand{}).Run(ctx, args)
 	case "replicate":
 		c := NewReplicateCommand()
 		if err := c.ParseFlags(ctx, args); err != nil {
@@ -116,10 +118,12 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 
 	case "restore":
 		return (&RestoreCommand{}).Run(ctx, args)
+	case "snapshots":
+		return (&SnapshotsCommand{}).Run(ctx, args)
 	case "version":
 		return (&VersionCommand{}).Run(ctx, args)
 	case "wal":
-		return (&LTXCommand{}).Run(ctx, args)
+		return (&WALCommand{}).Run(ctx, args)
 	default:
 		if cmd == "" || cmd == "help" || strings.HasPrefix(cmd, "-") {
 			m.Usage()
@@ -141,8 +145,10 @@ Usage:
 The commands are:
 
 	databases    list databases specified in config file
+	generations  list available generations for a database
 	replicate    runs a server to replicate databases
 	restore      recovers database backup from a replica
+	snapshots    list available snapshots for a database
 	version      prints the binary version
 	wal          list available WAL files for a database
 `[1:])
@@ -166,13 +172,6 @@ type Config struct {
 
 	// Logging
 	Logging LoggingConfig `yaml:"logging"`
-
-	// MCP server options
-	MCPAddr string `yaml:"mcp-addr"`
-
-	// Path to the config file
-	// This is only used internally to pass the config path to the MCP tool
-	ConfigPath string `yaml:"-"`
 }
 
 // LoggingConfig configures logging.
@@ -288,7 +287,6 @@ type DBConfig struct {
 	MetaPath           *string        `yaml:"meta-path"`
 	MonitorInterval    *time.Duration `yaml:"monitor-interval"`
 	CheckpointInterval *time.Duration `yaml:"checkpoint-interval"`
-	BusyTimeout        *time.Duration `yaml:"busy-timeout"`
 	MinCheckpointPageN *int           `yaml:"min-checkpoint-page-count"`
 	MaxCheckpointPageN *int           `yaml:"max-checkpoint-page-count"`
 
@@ -314,9 +312,6 @@ func NewDBFromConfig(dbc *DBConfig) (*litestream.DB, error) {
 	}
 	if dbc.CheckpointInterval != nil {
 		db.CheckpointInterval = *dbc.CheckpointInterval
-	}
-	if dbc.BusyTimeout != nil {
-		db.BusyTimeout = *dbc.BusyTimeout
 	}
 	if dbc.MinCheckpointPageN != nil {
 		db.MinCheckpointPageN = *dbc.MinCheckpointPageN
@@ -346,6 +341,7 @@ type ReplicaConfig struct {
 	Retention              *time.Duration `yaml:"retention"`
 	RetentionCheckInterval *time.Duration `yaml:"retention-check-interval"`
 	SyncInterval           *time.Duration `yaml:"sync-interval"`
+	SnapshotInterval       *time.Duration `yaml:"snapshot-interval"`
 	ValidationInterval     *time.Duration `yaml:"validation-interval"`
 
 	// S3 settings
@@ -392,6 +388,9 @@ func NewReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestream.Re
 	if v := c.SyncInterval; v != nil {
 		r.SyncInterval = *v
 	}
+	if v := c.SnapshotInterval; v != nil {
+		r.SnapshotInterval = *v
+	}
 	if v := c.ValidationInterval; v != nil {
 		r.ValidationInterval = *v
 	}
@@ -419,19 +418,19 @@ func NewReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestream.Re
 			return nil, err
 		}
 	case "s3":
-		if r.Client, err = newS3ReplicaClientFromConfig(c); err != nil {
+		if r.Client, err = newS3ReplicaClientFromConfig(c, r); err != nil {
 			return nil, err
 		}
 	case "gcs":
-		if r.Client, err = newGCSReplicaClientFromConfig(c); err != nil {
+		if r.Client, err = newGCSReplicaClientFromConfig(c, r); err != nil {
 			return nil, err
 		}
 	case "abs":
-		if r.Client, err = newABSReplicaClientFromConfig(c); err != nil {
+		if r.Client, err = newABSReplicaClientFromConfig(c, r); err != nil {
 			return nil, err
 		}
 	case "sftp":
-		if r.Client, err = newSFTPReplicaClientFromConfig(c); err != nil {
+		if r.Client, err = newSFTPReplicaClientFromConfig(c, r); err != nil {
 			return nil, err
 		}
 	default:
@@ -473,7 +472,7 @@ func newFileReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ 
 }
 
 // newS3ReplicaClientFromConfig returns a new instance of s3.ReplicaClient built from config.
-func newS3ReplicaClientFromConfig(c *ReplicaConfig) (_ *s3.ReplicaClient, err error) {
+func newS3ReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ *s3.ReplicaClient, err error) {
 	// Ensure URL & constituent parts are not both specified.
 	if c.URL != "" && c.Path != "" {
 		return nil, fmt.Errorf("cannot specify url & path for s3 replica")
@@ -536,7 +535,7 @@ func newS3ReplicaClientFromConfig(c *ReplicaConfig) (_ *s3.ReplicaClient, err er
 }
 
 // newGCSReplicaClientFromConfig returns a new instance of gcs.ReplicaClient built from config.
-func newGCSReplicaClientFromConfig(c *ReplicaConfig) (_ *gcs.ReplicaClient, err error) {
+func newGCSReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ *gcs.ReplicaClient, err error) {
 	// Ensure URL & constituent parts are not both specified.
 	if c.URL != "" && c.Path != "" {
 		return nil, fmt.Errorf("cannot specify url & path for gcs replica")
@@ -575,7 +574,7 @@ func newGCSReplicaClientFromConfig(c *ReplicaConfig) (_ *gcs.ReplicaClient, err 
 }
 
 // newABSReplicaClientFromConfig returns a new instance of abs.ReplicaClient built from config.
-func newABSReplicaClientFromConfig(c *ReplicaConfig) (_ *abs.ReplicaClient, err error) {
+func newABSReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ *abs.ReplicaClient, err error) {
 	// Ensure URL & constituent parts are not both specified.
 	if c.URL != "" && c.Path != "" {
 		return nil, fmt.Errorf("cannot specify url & path for abs replica")
@@ -618,7 +617,7 @@ func newABSReplicaClientFromConfig(c *ReplicaConfig) (_ *abs.ReplicaClient, err 
 }
 
 // newSFTPReplicaClientFromConfig returns a new instance of sftp.ReplicaClient built from config.
-func newSFTPReplicaClientFromConfig(c *ReplicaConfig) (_ *sftp.ReplicaClient, err error) {
+func newSFTPReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ *sftp.ReplicaClient, err error) {
 	// Ensure URL & constituent parts are not both specified.
 	if c.URL != "" && c.Path != "" {
 		return nil, fmt.Errorf("cannot specify url & path for sftp replica")
@@ -755,23 +754,23 @@ func expand(s string) (string, error) {
 	return filepath.Join(u.HomeDir, strings.TrimPrefix(s, prefix)), nil
 }
 
-// txidVar allows the flag package to parse index flags as hex-formatted TXIDs
-type txidVar ltx.TXID
+// indexVar allows the flag package to parse index flags as 4-byte hexadecimal values.
+type indexVar int
 
 // Ensure type implements interface.
-var _ flag.Value = (*txidVar)(nil)
+var _ flag.Value = (*indexVar)(nil)
 
 // String returns an 8-character hexadecimal value.
-func (v *txidVar) String() string {
-	return ltx.TXID(*v).String()
+func (v *indexVar) String() string {
+	return fmt.Sprintf("%08x", int(*v))
 }
 
 // Set parses s into an integer from a hexadecimal value.
-func (v *txidVar) Set(s string) error {
-	txID, err := ltx.ParseTXID(s)
+func (v *indexVar) Set(s string) error {
+	i, err := strconv.ParseInt(s, 16, 32)
 	if err != nil {
-		return fmt.Errorf("invalid txid format")
+		return fmt.Errorf("invalid hexadecimal format")
 	}
-	*v = txidVar(txID)
+	*v = indexVar(i)
 	return nil
 }
